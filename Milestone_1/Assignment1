@@ -1,0 +1,149 @@
+import os
+import pandas as pd
+import torch
+from sklearn.model_selection import train_test_split
+from transformers import (
+    GPT2Tokenizer,
+    GPT2LMHeadModel,
+    TrainingArguments,
+    Trainer,
+    pipeline,
+)
+from datasets import Dataset, DatasetDict
+
+# Path to save the preprocessed dataset
+PREPROCESSED_DATA_PATH = "./preprocessed_dataset.pt"
+
+def load_csv_dataset(file_path):
+    df = pd.read_csv(file_path)
+    return {"text": df["text"].tolist()}
+
+
+def preprocess_and_split_dataset(dataset_path, tokenizer, max_length=128, test_size=0.1):
+    """Load, preprocess, and split the dataset."""
+    #checking for preprocessed data
+    if os.path.exists(PREPROCESSED_DATA_PATH):
+        print("Loading preprocessed dataset...")
+        return torch.load(PREPROCESSED_DATA_PATH)
+
+    #If not, preprocess
+    print("Loading dataset...")
+    raw_data = load_csv_dataset(dataset_path)
+
+    # Tokenize dataset
+    print("Tokenizing dataset...")
+    def tokenize_function(examples):
+        encoding = tokenizer(examples["text"], truncation=True, max_length=max_length, padding="max_length")
+        encoding["labels"] = encoding["input_ids"]
+        return encoding
+
+    raw_dataset = Dataset.from_dict(raw_data)
+    tokenized_dataset = raw_dataset.map(tokenize_function, batched=True)
+    tokenized_dataset = tokenized_dataset.remove_columns(["text"])
+
+    #Convert to pandas DataFrame
+    tokenized_df = tokenized_dataset.to_pandas()
+
+    # Split dataset using sklearn's train_test_split
+    print("Splitting dataset...")
+    train_df, val_df = train_test_split(tokenized_df, test_size=test_size)
+
+    # Convert back to Hugging Face Dataset format
+    train_dataset = Dataset.from_pandas(train_df)
+    val_dataset = Dataset.from_pandas(val_df)
+
+    #Saving the processed dataset
+    dataset = DatasetDict({
+        "train": train_dataset,
+        "validation": val_dataset,
+    })
+    print("Saving preprocessed dataset...")
+    torch.save(dataset, PREPROCESSED_DATA_PATH)
+
+    return dataset
+
+
+def fine_tune_model(dataset, tokenizer, model_name="gpt2", output_dir="./fine_tuned_model"):
+    #Fine-tune the GPT-2 model on the dataset
+    print("Loading pre-trained model...")
+    model = GPT2LMHeadModel.from_pretrained(model_name)
+    model.resize_token_embeddings(len(tokenizer))
+
+    #training arguments
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        evaluation_strategy="epoch",
+        learning_rate=5e-5,
+        per_device_train_batch_size=8,
+        num_train_epochs=3,
+        save_strategy="epoch",
+        logging_dir="./logs",
+        save_total_limit=2,
+        fp16=True,
+    )
+
+    #Trainer setup
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["validation"],
+    )
+
+    print("Fine-tuning model...")
+    trainer.train()
+
+    #Saving Fine-tuned model
+    print(f"Saving model to {output_dir}...")
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+
+
+def generate_text(prompt, model_path="./fine_tuned_model", max_length=30, temperature=0.7, top_p=0.9):
+    print("Loading fine-tuned model...")
+    generator = pipeline("text-generation", model=model_path, tokenizer=model_path)
+
+    print("Generating text...")
+    output = generator(
+        prompt,
+        max_length=max_length,
+        num_return_sequences=1,
+        temperature=temperature,
+        top_p=top_p,
+        pad_token_id=50256,  # Ensures padding if max_length isn't reached
+        eos_token_id=50256  # End generation on a sentence break
+    )
+
+    generated_text = output[0]["generated_text"].strip()
+    if "." in generated_text:
+        generated_text = generated_text.split(".")[0] + "."
+
+    return generated_text
+
+
+
+def main():
+    
+    dataset_path = "dataset.csv" 
+    output_dir = "./fine_tuned_model"
+
+    # Tokenizer setup
+    print("Loading tokenizer...")
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+
+    #Preprocess dataset
+    dataset = preprocess_and_split_dataset(dataset_path, tokenizer)
+
+    # Fine-tune model
+    fine_tune_model(dataset, tokenizer, output_dir=output_dir)
+
+    #Test text generation
+    prompt = "I like"
+    generated_text = generate_text(prompt, model_path=output_dir)
+    print("\nGenerated Text:")
+    print(generated_text)
+
+
+if __name__ == "__main__":
+    main()
